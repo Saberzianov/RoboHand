@@ -1,0 +1,172 @@
+#include <iostream>
+#include <cmath>
+#include <thread>
+#include <chrono>
+
+// Трёхмерная точка
+struct Point3D {
+    double x, y, z;
+    Point3D(double x = 0, double y = 0, double z = 0) : x(x), y(y), z(z) {}
+};
+
+// Класс манипулятора (абстрактный, для реального эмулятора нужна реализация методов)
+class Manipulator {
+private:
+    Point3D current_position;
+    bool gripper_closed;
+    double gripper_force; // сила сжатия (зависит от объёма объекта)
+
+public:
+    Manipulator() : current_position(0, 0, 0), gripper_closed(false), gripper_force(0.0) {}
+
+    // Инициализация (подключение к эмулятору, установка начального положения)
+    bool init(const Point3D& start_pos) {
+        current_position = start_pos;
+        gripper_closed = false;
+        gripper_force = 0.0;
+        std::cout << "Манипулятор инициализирован в позиции (" 
+                  << start_pos.x << ", " << start_pos.y << ", " << start_pos.z << ")\n";
+        // Здесь должен быть код реального подключения к эмулятору
+        return true;
+    }
+
+    // Перемещение в заданную точку (линейная интерполяция для плавности)
+    bool moveTo(const Point3D& target, double speed = 0.1) {
+        std::cout << "Перемещение из (" << current_position.x << ", " << current_position.y << ", " << current_position.z
+                  << ") в (" << target.x << ", " << target.y << ", " << target.z << ")\n";
+        
+        // Простейшая линейная интерполяция (для эмуляции движения)
+        double steps = 100;
+        for (int i = 0; i <= steps; ++i) {
+            double t = i / steps;
+            Point3D intermediate(
+                current_position.x + t * (target.x - current_position.x),
+                current_position.y + t * (target.y - current_position.y),
+                current_position.z + t * (target.z - current_position.z)
+            );
+            // В реальном эмуляторе здесь вызывается функция setJointAngles или setPosition
+            // Например: emulator_setPosition(intermediate.x, intermediate.y, intermediate.z);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // имитация времени движения
+        }
+        current_position = target;
+        std::cout << "Манипулятор прибыл в точку (" << target.x << ", " << target.y << ", " << target.z << ")\n";
+        return true;
+    }
+
+    // Открыть захват
+    bool openGripper() {
+        if (!gripper_closed) {
+            std::cout << "Захват уже открыт.\n";
+            return true;
+        }
+        std::cout << "Открытие захвата...\n";
+        // Здесь вызов API эмулятора: emulator_setGripper(0); 
+        gripper_closed = false;
+        gripper_force = 0.0;
+        return true;
+    }
+
+    // Закрыть захват с усилием, зависящим от объёма объекта
+    bool closeGripper(double object_volume) {
+        if (gripper_closed) {
+            std::cout << "Захват уже закрыт.\n";
+            return false;
+        }
+        // Рассчитываем усилие: чем больше объём, тем сильнее сжатие (условно)
+        gripper_force = std::min(1.0, object_volume / 1000.0); // пример: объём в см³
+        std::cout << "Закрытие захвата с усилием " << gripper_force << " (объём объекта = " << object_volume << ")\n";
+        // Здесь вызов API: emulator_setGripper(1, gripper_force);
+        gripper_closed = true;
+        return true;
+    }
+
+    // Получить текущую позицию
+    Point3D getCurrentPosition() const {
+        return current_position;
+    }
+};
+
+// Функция для безопасного захвата объекта
+bool pickupObject(Manipulator& robot, const Point3D& object_pos, double object_volume, double approach_distance) {
+    std::cout << "\n=== Захват объекта ===\n";
+    
+    // 1. Открыть захват перед подходом
+    if (!robot.openGripper()) return false;
+    
+    // 2. Переместиться в точку над объектом (с учётом безопасного расстояния)
+    Point3D above_object(object_pos.x, object_pos.y, object_pos.z + approach_distance);
+    if (!robot.moveTo(above_object)) return false;
+    
+    // 3. Опуститься непосредственно к объекту
+    if (!robot.moveTo(object_pos)) return false;
+    
+    // 4. Закрыть захват, захватить объект
+    if (!robot.closeGripper(object_volume)) return false;
+    
+    // 5. Поднять объект (вернуться в точку над объектом)
+    if (!robot.moveTo(above_object)) return false;
+    
+    std::cout << "Объект захвачен и поднят.\n";
+    return true;
+}
+
+// Функция для перемещения захваченного объекта в корзину
+bool placeObjectInBasket(Manipulator& robot, const Point3D& basket_pos, double approach_distance) {
+    std::cout << "\n=== Размещение объекта в корзине ===\n";
+    
+    // 1. Переместиться в точку над корзиной
+    Point3D above_basket(basket_pos.x, basket_pos.y, basket_pos.z + approach_distance);
+    if (!robot.moveTo(above_basket)) return false;
+    
+    // 2. Опуститься к корзине
+    if (!robot.moveTo(basket_pos)) return false;
+    
+    // 3. Открыть захват – отпустить объект
+    if (!robot.openGripper()) return false;
+    
+    // 4. Поднять захват
+    if (!robot.moveTo(above_basket)) return false;
+    
+    std::cout << "Объект помещён в корзину.\n";
+    return true;
+}
+
+int main() {
+    // Известные параметры
+    Point3D start_position(0, 0, 0);      // начальное положение манипулятора
+    Point3D object_position(200, 150, 50); // координаты объекта (в мм или см, зависит от эмулятора)
+    Point3D basket_position(300, 100, 0);  // координаты корзины
+    double object_volume = 250.0;          // объём объекта (например, 250 см³)
+    double distance_to_object = 150.0;     // расстояние от манипулятора до объекта (для информации)
+    double approach_distance = 50.0;       // безопасная высота подъёма/опускания
+
+    // Вывод известной информации
+    std::cout << "Известные данные:\n";
+    std::cout << " - Положение манипулятора: (" << start_position.x << ", " << start_position.y << ", " << start_position.z << ")\n";
+    std::cout << " - Положение объекта: (" << object_position.x << ", " << object_position.y << ", " << object_position.z << ")\n";
+    std::cout << " - Расстояние до объекта: " << distance_to_object << "\n";
+    std::cout << " - Объём объекта: " << object_volume << "\n";
+    std::cout << " - Положение корзины: (" << basket_position.x << ", " << basket_position.y << ", " << basket_position.z << ")\n\n";
+
+    // Создаём и инициализируем манипулятор
+    Manipulator robot;
+    if (!robot.init(start_position)) {
+        std::cerr << "Ошибка инициализации манипулятора\n";
+        return 1;
+    }
+
+    // Захватываем объект
+    if (!pickupObject(robot, object_position, object_volume, approach_distance)) {
+        std::cerr << "Не удалось захватить объект\n";
+        return 1;
+    }
+
+    // Перемещаем объект в корзину
+    if (!placeObjectInBasket(robot, basket_position, approach_distance)) {
+        std::cerr << "Не удалось поместить объект в корзину\n";
+        return 1;
+    }
+
+    std::cout << "\nЗадание успешно выполнено!\n";
+    return 0;
+}
