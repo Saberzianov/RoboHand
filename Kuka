@@ -1,0 +1,364 @@
+#include <webots/motor.h>
+#include <webots/robot.h>
+#include <webots/position_sensor.h>
+#include <iostream>
+#include <cmath>
+#include <thread>
+#include <chrono>
+
+#define TIME_STEP 32
+#define PI 3.14159265358979323846
+
+// Трёхмерная точка
+struct Point3D {
+    double x, y, z;
+    Point3D(double x = 0, double y = 0, double z = 0) : x(x), y(y), z(z) {}
+};
+
+// Класс манипулятора для KUKA youBot
+class Manipulator {
+private:
+    // Моторы youBot
+    WbDeviceTag arm_joint1;      // основание
+    WbDeviceTag arm_joint2;      // плечо
+    WbDeviceTag arm_joint3;      // локоть
+    WbDeviceTag arm_joint4;      // запястье 1
+    WbDeviceTag arm_joint5;      // запястье 2
+    
+    // Моторы захвата youBot
+    WbDeviceTag gripper_left;
+    WbDeviceTag gripper_right;
+    
+    // Датчики положения
+    WbDeviceTag sensors[5];
+    
+    Point3D current_position;
+    bool gripper_closed;
+    double gripper_force;
+    
+    // Параметры youBot (в метрах)
+    const double L1 = 0.147;      // длина от основания до плеча
+    const double L2 = 0.155;      // длина плеча
+    const double L3 = 0.135;      // длина предплечья
+    const double L4 = 0.081;      // длина запястья
+    
+    // Текущие углы
+    double current_angles[5];
+    
+    // Прямая кинематика для youBot
+    Point3D forwardKinematics(double angles[5]) {
+        double x = 0, y = 0, z = L1;
+        
+        // Углы в радианах
+        double q1 = angles[0];
+        double q2 = angles[1];
+        double q3 = angles[2];
+        double q4 = angles[3];
+        double q5 = angles[4];
+        
+        // Простая кинематическая модель youBot
+        x = (L2 * sin(q2) + L3 * sin(q2 + q3) + L4 * sin(q2 + q3 + q4)) * cos(q1);
+        y = (L2 * sin(q2) + L3 * sin(q2 + q3) + L4 * sin(q2 + q3 + q4)) * sin(q1);
+        z = L1 + L2 * cos(q2) + L3 * cos(q2 + q3) + L4 * cos(q2 + q3 + q4);
+        
+        return Point3D(x, y, z);
+    }
+    
+    // Обратная кинематика для youBot
+    bool inverseKinematics(const Point3D& target, double angles[5]) {
+        // Расстояние до цели в горизонтальной плоскости
+        double r = sqrt(target.x * target.x + target.y * target.y);
+        double z = target.z - L1;
+        
+        // Проверка достижимости
+        double max_reach = L2 + L3 + L4;
+        double distance = sqrt(r * r + z * z);
+        
+        if (distance > max_reach) {
+            std::cerr << "Цель вне зоны досягаемости: " << distance << " > " << max_reach << "\n";
+            return false;
+        }
+        
+        // Угол поворота основания
+        angles[0] = atan2(target.y, target.x);
+        
+        // Решение для плеча и локтя (упрощённое)
+        double cos_q3 = (distance * distance - L2 * L2 - L3 * L3) / (2 * L2 * L3);
+        cos_q3 = std::max(-1.0, std::min(1.0, cos_q3));
+        
+        angles[2] = atan2(-sqrt(1 - cos_q3 * cos_q3), cos_q3); // elbow down
+        
+        double alpha = atan2(z, r);
+        double beta = acos((L2 * L2 + distance * distance - L3 * L3) / (2 * L2 * distance));
+        
+        angles[1] = alpha + beta;
+        
+        // Углы запястья (держать схват горизонтально)
+        angles[3] = -angles[1] - angles[2];
+        angles[4] = 0.0;
+        
+        return true;
+    }
+    
+    // Ожидание достижения позиции
+    void waitForPosition(double target_angles[5]) {
+        bool reached = false;
+        int steps = 0;
+        
+        while (!reached && steps < 200) {
+            if (wb_robot_step(TIME_STEP) == -1) break;
+            
+            // Читаем текущие углы с датчиков
+            double current_angles[5];
+            bool all_reached = true;
+            
+            for (int i = 0; i < 5; i++) {
+                if (sensors[i]) {
+                    current_angles[i] = wb_position_sensor_get_value(sensors[i]);
+                    if (fabs(current_angles[i] - target_angles[i]) > 0.02) {
+                        all_reached = false;
+                    }
+                }
+            }
+            
+            if (all_reached) {
+                reached = true;
+            }
+            
+            steps++;
+        }
+    }
+
+public:
+    Manipulator() : current_position(0, 0, 0), gripper_closed(false), gripper_force(0.0) {
+        for (int i = 0; i < 5; i++) {
+            sensors[i] = 0;
+            current_angles[i] = 0;
+        }
+    }
+    
+    // Инициализация youBot
+    bool init(const Point3D& start_pos) {
+        wb_robot_init();
+        
+        // Получаем моторы youBot
+        arm_joint1 = wb_robot_get_device("arm_1_joint");
+        arm_joint2 = wb_robot_get_device("arm_2_joint");
+        arm_joint3 = wb_robot_get_device("arm_3_joint");
+        arm_joint4 = wb_robot_get_device("arm_4_joint");
+        arm_joint5 = wb_robot_get_device("arm_5_joint");
+        
+        // Получаем моторы захвата
+        gripper_left = wb_robot_get_device("gripper_left_finger_joint");
+        gripper_right = wb_robot_get_device("gripper_right_finger_joint");
+        
+        // Получаем датчики положения
+        sensors[0] = wb_robot_get_device("arm_1_sensor");
+        sensors[1] = wb_robot_get_device("arm_2_sensor");
+        sensors[2] = wb_robot_get_device("arm_3_sensor");
+        sensors[3] = wb_robot_get_device("arm_4_sensor");
+        sensors[4] = wb_robot_get_device("arm_5_sensor");
+        
+        // Включаем датчики
+        for (int i = 0; i < 5; i++) {
+            if (sensors[i]) {
+                wb_position_sensor_enable(sensors[i], TIME_STEP);
+            }
+        }
+        
+        // Проверка наличия устройств
+        if (!arm_joint1 || !arm_joint2 || !arm_joint3 || !arm_joint4 || !arm_joint5) {
+            std::cerr << "Ошибка: не удалось получить моторы youBot\n";
+            return false;
+        }
+        
+        if (!gripper_left || !gripper_right) {
+            std::cerr << "Предупреждение: захват не найден\n";
+        }
+        
+        // Начальная позиция
+        double start_angles[5] = {0, -PI/4, PI/4, 0, 0};
+        setJointAngles(start_angles);
+        waitForPosition(start_angles);
+        
+        // Открываем захват
+        openGripper();
+        
+        current_position = start_pos;
+        std::cout << "Манипулятор youBot инициализирован в позиции (" 
+                  << start_pos.x << ", " << start_pos.y << ", " << start_pos.z << ")\n";
+        
+        return true;
+    }
+    
+    // Установка углов
+    void setJointAngles(double angles[5]) {
+        wb_motor_set_position(arm_joint1, angles[0]);
+        wb_motor_set_position(arm_joint2, angles[1]);
+        wb_motor_set_position(arm_joint3, angles[2]);
+        wb_motor_set_position(arm_joint4, angles[3]);
+        wb_motor_set_position(arm_joint5, angles[4]);
+        
+        for (int i = 0; i < 5; i++) {
+            current_angles[i] = angles[i];
+        }
+    }
+    
+    // Перемещение в заданную точку (с интерполяцией)
+    bool moveTo(const Point3D& target, double speed = 0.1) {
+        std::cout << "Перемещение из (" << current_position.x << ", " << current_position.y << ", " << current_position.z
+                  << ") в (" << target.x << ", " << target.y << ", " << target.z << ")\n";
+        
+        // Рассчитываем целевые углы
+        double target_angles[5];
+        if (!inverseKinematics(target, target_angles)) {
+            std::cerr << "Не удалось рассчитать углы для целевой точки\n";
+            return false;
+        }
+        
+        // Интерполяция углов для плавного движения
+        double steps = 50;
+        for (int i = 0; i <= steps; ++i) {
+            double t = i / steps;
+            double intermediate_angles[5];
+            
+            for (int j = 0; j < 5; j++) {
+                intermediate_angles[j] = current_angles[j] + t * (target_angles[j] - current_angles[j]);
+            }
+            
+            setJointAngles(intermediate_angles);
+            wb_robot_step(TIME_STEP);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        
+        // Финальная установка и ожидание
+        setJointAngles(target_angles);
+        waitForPosition(target_angles);
+        
+        current_position = target;
+        std::cout << "Манипулятор youBot прибыл в точку (" << target.x << ", " << target.y << ", " << target.z << ")\n";
+        return true;
+    }
+    
+    // Открыть захват
+    bool openGripper() {
+        if (!gripper_closed) {
+            std::cout << "Захват уже открыт.\n";
+            return true;
+        }
+        
+        std::cout << "Открытие захвата youBot...\n";
+        
+        if (gripper_left && gripper_right) {
+            wb_motor_set_position(gripper_left, 0.0);
+            wb_motor_set_position(gripper_right, 0.0);
+            wb_robot_step(20 * TIME_STEP);
+        }
+        
+        gripper_closed = false;
+        gripper_force = 0.0;
+        return true;
+    }
+    
+    // Закрыть захват с усилием
+    bool closeGripper(double object_volume) {
+        if (gripper_closed) {
+            std::cout << "Захват уже закрыт.\n";
+            return false;
+        }
+        
+        gripper_force = std::min(1.0, object_volume / 1000.0);
+        std::cout << "Закрытие захвата youBot с усилием " << gripper_force 
+                  << " (объём объекта = " << object_volume << ")\n";
+        
+        if (gripper_left && gripper_right) {
+            // Для youBot: позиция 0.015 = закрыто
+            double grip_pos = std::min(0.015, gripper_force * 0.015);
+            wb_motor_set_position(gripper_left, grip_pos);
+            wb_motor_set_position(gripper_right, grip_pos);
+            wb_robot_step(20 * TIME_STEP);
+        }
+        
+        gripper_closed = true;
+        return true;
+    }
+    
+    Point3D getCurrentPosition() const {
+        return current_position;
+    }
+};
+
+// Функция для безопасного захвата объекта (ВАША ЛОГИКА)
+bool pickupObject(Manipulator& robot, const Point3D& object_pos, double object_volume, double approach_distance) {
+    std::cout << "\n=== Захват объекта ===\n";
+    
+    if (!robot.openGripper()) return false;
+    
+    Point3D above_object(object_pos.x, object_pos.y, object_pos.z + approach_distance);
+    if (!robot.moveTo(above_object)) return false;
+    if (!robot.moveTo(object_pos)) return false;
+    if (!robot.closeGripper(object_volume)) return false;
+    if (!robot.moveTo(above_object)) return false;
+    
+    std::cout << "Объект захвачен и поднят.\n";
+    return true;
+}
+
+// Функция для перемещения в корзину (ВАША ЛОГИКА)
+bool placeObjectInBasket(Manipulator& robot, const Point3D& basket_pos, double approach_distance) {
+    std::cout << "\n=== Размещение объекта в корзине ===\n";
+    
+    Point3D above_basket(basket_pos.x, basket_pos.y, basket_pos.z + approach_distance);
+    if (!robot.moveTo(above_basket)) return false;
+    if (!robot.moveTo(basket_pos)) return false;
+    if (!robot.openGripper()) return false;
+    if (!robot.moveTo(above_basket)) return false;
+    
+    std::cout << "Объект помещён в корзину.\n";
+    return true;
+}
+
+int main() {
+    // ВАШИ ПАРАМЕТРЫ (для youBot координаты в метрах)
+    Point3D start_position(0, 0, 0);           // начальное положение
+    Point3D object_position(0.3, 0.2, 0.15);   // объект на столе (30 см по X, 20 см по Y, высота 15 см)
+    Point3D basket_position(0.5, -0.1, 0.0);   // корзина
+    double object_volume = 250.0;              // объём объекта (см³)
+    double distance_to_object = 0.36;          // расстояние до объекта
+    double approach_distance = 0.1;            // безопасная высота (10 см)
+
+    // Вывод информации
+    std::cout << "=== Управление манипулятором KUKA youBot ===\n";
+    std::cout << "Известные данные:\n";
+    std::cout << " - Положение манипулятора: (" << start_position.x << ", " << start_position.y << ", " << start_position.z << ")\n";
+    std::cout << " - Положение объекта: (" << object_position.x << ", " << object_position.y << ", " << object_position.z << ")\n";
+    std::cout << " - Расстояние до объекта: " << distance_to_object << "\n";
+    std::cout << " - Объём объекта: " << object_volume << "\n";
+    std::cout << " - Положение корзины: (" << basket_position.x << ", " << basket_position.y << ", " << basket_position.z << ")\n\n";
+
+    // Создаём и инициализируем манипулятор
+    Manipulator robot;
+    if (!robot.init(start_position)) {
+        std::cerr << "Ошибка инициализации манипулятора youBot\n";
+        return 1;
+    }
+
+    // Захватываем объект
+    if (!pickupObject(robot, object_position, object_volume, approach_distance)) {
+        std::cerr << "Не удалось захватить объект\n";
+        return 1;
+    }
+
+    // Перемещаем объект в корзину
+    if (!placeObjectInBasket(robot, basket_position, approach_distance)) {
+        std::cerr << "Не удалось поместить объект в корзину\n";
+        return 1;
+    }
+
+    std::cout << "\n=== Задание успешно выполнено! ===\n";
+    
+    // Бесконечный цикл, чтобы симуляция не закрылась
+    while (wb_robot_step(TIME_STEP) != -1) {}
+    
+    return 0;
+}
